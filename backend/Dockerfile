@@ -12,4 +12,7 @@ COPY app.py .
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+ENV PORT=5000
+ENV GUNICORN_WORKERS=4
+
+CMD ["sh", "-c", "gunicorn -w ${GUNICORN_WORKERS} -b 0.0.0.0:${PORT} --timeout 120 'app:app'"]

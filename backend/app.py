@@ -1,6 +1,8 @@
 import os
 import json
+from datetime import timedelta
 from flask import Flask, request
+from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity
 import bcrypt
 import redis
@@ -11,15 +13,72 @@ from shared.utils import success_response, error_response
 
 app = Flask(__name__)
 
-# Config
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://user:password@localhost/storefront')
+# -----------------
+# PRODUCTION CONFIG
+# -----------------
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL', 
+    'postgresql://user:password@localhost:5432/storefront'
+)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret')
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': int(os.environ.get('DB_POOL_RECYCLE', 300)),
+    'pool_size': int(os.environ.get('DB_POOL_SIZE', 10)),
+    'max_overflow': int(os.environ.get('DB_MAX_OVERFLOW', 20)),
+}
 
-# Initialize extensions
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret-key-change-in-production')
+jwt_expires_seconds = int(os.environ.get('JWT_ACCESS_TOKEN_EXPIRES_SECONDS', 86400))
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(seconds=jwt_expires_seconds)
+
+# Enable CORS for production & dev frontend origins
+allowed_origins_raw = os.environ.get('CORS_ALLOWED_ORIGINS', '*')
+allowed_origins = [o.strip() for o in allowed_origins_raw.split(',')] if ',' in allowed_origins_raw else allowed_origins_raw
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+
+# Initialize DB & JWT
 db.init_app(app)
 jwt = JWTManager(app)
-redis_client = redis.StrictRedis.from_url(os.environ.get('REDIS_URL', 'redis://localhost:6379/0'), decode_responses=True)
+
+# Resilient Redis Client
+redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+try:
+    redis_client = redis.StrictRedis.from_url(
+        redis_url, 
+        decode_responses=True, 
+        socket_timeout=2, 
+        socket_connect_timeout=2
+    )
+except Exception as e:
+    app.logger.warning(f"Failed to initialize Redis client: {e}")
+    redis_client = None
+
+
+def safe_redis_get(key):
+    try:
+        if redis_client:
+            return redis_client.get(key)
+    except Exception as e:
+        app.logger.warning(f"Redis get failed for key '{key}': {e}")
+    return None
+
+
+def safe_redis_setex(key, time, value):
+    try:
+        if redis_client:
+            redis_client.setex(key, time, value)
+    except Exception as e:
+        app.logger.warning(f"Redis setex failed for key '{key}': {e}")
+
+
+def safe_redis_flush():
+    try:
+        if redis_client:
+            redis_client.flushdb()
+    except Exception as e:
+        app.logger.warning(f"Redis flush failed: {e}")
+
 
 # -----------------
 # MODELS
@@ -33,6 +92,7 @@ class User(db.Model):
     password_hash = db.Column(db.String(200), nullable=False)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
     updated_at = db.Column(db.DateTime, server_default=db.func.now(), onupdate=db.func.now())
+
 
 class Product(db.Model):
     __tablename__ = 'products'
@@ -57,6 +117,7 @@ class Product(db.Model):
             'stock_quantity': self.stock_quantity
         }
 
+
 class CartItem(db.Model):
     __tablename__ = 'cart_items'
     id = db.Column(db.Integer, primary_key=True)
@@ -65,13 +126,15 @@ class CartItem(db.Model):
     quantity = db.Column(db.Integer, nullable=False, default=1)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
+
 class Order(db.Model):
     __tablename__ = 'orders'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, nullable=False, index=True)
     total_amount = db.Column(db.Float, nullable=False)
-    status = db.Column(db.String(50), default='Pending') # Pending, Confirmed, Shipped, Delivered
+    status = db.Column(db.String(50), default='Pending')  # Pending, Confirmed, Shipped, Delivered
     created_at = db.Column(db.DateTime, server_default=db.func.now())
+
 
 class OrderItem(db.Model):
     __tablename__ = 'order_items'
@@ -82,9 +145,41 @@ class OrderItem(db.Model):
     price = db.Column(db.Float, nullable=False)
 
 
-# Initialize DB
+# Initialize DB Schema safely
 with app.app_context():
-    db.create_all()
+    try:
+        db.create_all()
+    except Exception as e:
+        app.logger.error(f"Error creating database tables: {e}")
+
+
+# -----------------
+# HEALTH CHECK
+# -----------------
+@app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    db_status = "ok"
+    try:
+        db.session.execute(db.text("SELECT 1"))
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+
+    redis_status = "ok"
+    try:
+        if redis_client:
+            redis_client.ping()
+        else:
+            redis_status = "disabled"
+    except Exception as e:
+        redis_status = f"unhealthy: {str(e)}"
+
+    status_code = 200 if db_status == "ok" else 503
+    return {
+        'status': 'healthy' if status_code == 200 else 'unhealthy',
+        'database': db_status,
+        'redis': redis_status
+    }, status_code
 
 
 # -----------------
@@ -115,6 +210,7 @@ def register():
         'user': {'id': new_user.id, 'name': new_user.name, 'email': new_user.email}
     }, 'User registered successfully', 201)
 
+
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -133,6 +229,7 @@ def login():
         'refresh_token': refresh_token,
         'user': {'id': user.id, 'name': user.name, 'email': user.email}
     }, 'Login successful')
+
 
 @app.route('/api/users/profile', methods=['GET', 'PUT'])
 @jwt_required()
@@ -166,7 +263,7 @@ def get_products():
     per_page = int(request.args.get('per_page', 20))
     
     cache_key = f"products:cat:{category}:search:{search}:p:{page}:pp:{per_page}"
-    cached = redis_client.get(cache_key)
+    cached = safe_redis_get(cache_key)
     if cached:
         return success_response(json.loads(cached), "Products retrieved from cache")
 
@@ -185,12 +282,13 @@ def get_products():
         'current_page': page
     }
     
-    redis_client.setex(cache_key, 60, json.dumps(data))
+    safe_redis_setex(cache_key, 60, json.dumps(data))
     return success_response(data, "Products retrieved")
+
 
 @app.route('/api/products/<int:id>', methods=['GET'])
 def get_product(id):
-    cached = redis_client.get(f"product:{id}")
+    cached = safe_redis_get(f"product:{id}")
     if cached:
         return success_response(json.loads(cached), "Product retrieved from cache")
         
@@ -199,20 +297,22 @@ def get_product(id):
         return error_response('Product not found', 404)
         
     data = product.to_dict()
-    redis_client.setex(f"product:{id}", 300, json.dumps(data))
+    safe_redis_setex(f"product:{id}", 300, json.dumps(data))
     return success_response(data, "Product retrieved")
+
 
 @app.route('/api/categories', methods=['GET'])
 def get_categories():
-    cached = redis_client.get('categories')
+    cached = safe_redis_get('categories')
     if cached:
         return success_response(json.loads(cached), "Categories retrieved from cache")
         
     categories = db.session.query(Product.category).distinct().all()
     data = [c[0] for c in categories if c[0]]
     
-    redis_client.setex('categories', 3600, json.dumps(data))
+    safe_redis_setex('categories', 3600, json.dumps(data))
     return success_response(data, "Categories retrieved")
+
 
 @app.route('/api/products/seed', methods=['POST'])
 def seed_products():
@@ -233,7 +333,7 @@ def seed_products():
         db.session.add(product)
     
     db.session.commit()
-    redis_client.flushdb()
+    safe_redis_flush()
     return success_response(None, "Seeded 50 products")
 
 
@@ -269,6 +369,7 @@ def cart():
         db.session.commit()
         return success_response(None, 'Item added to cart')
 
+
 @app.route('/api/cart/<int:id>', methods=['PUT', 'DELETE'])
 @jwt_required()
 def update_cart(id):
@@ -288,6 +389,7 @@ def update_cart(id):
         db.session.delete(item)
         db.session.commit()
         return success_response(None, 'Item removed')
+
 
 @app.route('/api/orders', methods=['GET', 'POST'])
 @jwt_required()
@@ -318,6 +420,7 @@ def orders():
             
         db.session.commit()
         return success_response({'order_id': new_order.id}, 'Order placed successfully')
+
 
 @app.route('/api/orders/<int:id>', methods=['GET'])
 @jwt_required()
