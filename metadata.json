@@ -1,0 +1,6 @@
+{
+  "name": "Digital Storefront Platform",
+  "description": "A production-style Digital Storefront platform featuring React, Redux, and microservice backend integration architecture.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
