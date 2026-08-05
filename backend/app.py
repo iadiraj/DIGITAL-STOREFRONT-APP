@@ -6,11 +6,11 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity
 import bcrypt
 import redis
-
+from dotenv import load_dotenv
 # Import shared modules
 from shared.database import db
 from shared.utils import success_response, error_response
-
+load_dotenv()
 app = Flask(__name__)
 
 # -----------------
